@@ -9,6 +9,7 @@
 """
 Sample new images from a pre-trained DiT.
 """
+import os
 import argparse
 
 import torch
@@ -21,6 +22,14 @@ from opendit.models.latte import Latte_models
 from opendit.utils.download import find_model
 from opendit.vae.reconstruct import save_sample
 from opendit.vae.wrapper import AutoencoderKLWrapper
+
+# SHRIMP
+from opendit.utils.DatasetBuilder import DatasetBuilder
+from opendit.utils.dataset import SatelliteDataset
+from opendit.utils.data_utils import prepare_dataloader
+from tqdm import tqdm
+import time
+import numpy as np
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -49,7 +58,9 @@ def main(args):
             assert input_size[i] % vae.patch_size[i] == 0, "Input size must be divisible by patch size"
         input_size = [input_size[i] // vae.patch_size[i] for i in range(3)]
     else:
+        assert args.history_frames == 0, "History frames are not supported for image data."
         input_size = args.image_size // 8
+
 
     dtype = torch.float32
     if "DiT" in args.model:
@@ -66,6 +77,7 @@ def main(args):
     model = (
         model_class(
             input_size=input_size,
+            in_channels=12,  # 4 img_rgb + 4 img_extras + 4 radar #hardcoded
             num_classes=args.num_classes,
             enable_flashattn=False,
             enable_layernorm_kernel=False,
@@ -83,42 +95,124 @@ def main(args):
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
 
-    # Create sampling noise:
-    if args.use_video:
-        # Labels to condition the model with (feel free to change):
-        class_labels = ["Biking", "Cliff Diving", "Rock Climbing Indoor", "Punch", "TaiChi"]
-        n = len(class_labels)
-        z = torch.randn(n, vae.out_channels, *input_size, device=device)
-        y = class_labels * 2
-    else:
-        # Labels to condition the model with (feel free to change):
-        if args.num_classes == 1000:
-            class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-        else:
-            class_labels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-        n = len(class_labels)
-        z = torch.randn(n, 4, input_size, input_size, device=device)
-        y = torch.tensor(class_labels, device=device)
-        y_null = torch.tensor([0] * n, device=device)
-        y = torch.cat([y, y_null], 0)
-
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-
-    # Sample images:
-    samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+    # Setup data:
+    datasetbuilder = DatasetBuilder(
+        sat_path=args.sat_files_path,
+        radar_path=args.radar_files_path,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        max_folders=args.max_folders,
+        history_frames=args.history_frames,
+        future_frame=args.future_frame,
+        refresh_rate=args.refresh_rate,
+        coverage_threshold=0.05,
+        seed=96
     )
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+    dataset_pkl_name = "dataset_filelist.pkl"
+    dataset_pkl_path = os.path.join(args.outputs, dataset_pkl_name)
+    assert args.retrieve_dataset, "Please set --retrieve_dataset to True to load the dataset."
+    _, _, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
+    print(f"Loaded existing dataset from {dataset_pkl_path}")
+    
+    # Load dataset
+    test_dataset = SatelliteDataset(files=test_files, in_dim=args.in_dim, transform=None)
 
-    # Save and display images:
-    if args.use_video:
-        samples = vae.decode(samples)
-        save_sample(samples)
-    else:
-        samples = vae.decode(samples / 0.18215).sample
-        save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+    test_dataloader = prepare_dataloader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=True,
+        num_workers=args.num_workers,
+    )
+    print(f"Test Dataset contains {len(test_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
+    all_imgs = []
+    all_masks = []
+    all_img_times = []
+    all_mask_times = []
+    all_samples = []
+    test_loop = tqdm(test_dataloader, desc="Sampling (Test)", total=len(test_dataloader))
+    for idx, data in enumerate(test_loop):
+        start_time = time.time()
+
+        imgs, masks, img_times, mask_times = data
+        
+        all_imgs.append(imgs)
+        all_masks.append(masks)
+        all_img_times.append(img_times)
+        all_mask_times.append(mask_times)
+
+        imgs = imgs.permute(0, 3, 1, 2).to(device)
+
+        # VAE encode
+        with torch.no_grad():
+            # Map input images to latent space + normalize latents:
+            imgs_rgb = imgs[:, :3, :, :]  # (B, 3, H, W)
+            imgs_extras = imgs[:, 3:, :, :].repeat(1, 3, 1, 1) if args.in_dim==5 else imgs[:, 3:, :, :]  # if (B, 1, H, W): -> (B, 3, H, W)
+            imgs_rgb = vae.encode(imgs_rgb)
+            imgs_extras = vae.encode(imgs_extras)
+
+            if not args.use_video:
+                imgs_rgb = imgs_rgb.latent_dist.sample().mul_(0.18215)
+                imgs_extras = imgs_extras.latent_dist.sample().mul_(0.18215)
+                imgs = torch.cat((imgs_rgb, imgs_extras), dim=1)  # (B, 8, H, W)
+        
+        # Create sampling noise:
+        if args.use_video:
+            # Labels to condition the model with (feel free to change):
+            class_labels = ["Biking", "Cliff Diving", "Rock Climbing Indoor", "Punch", "TaiChi"]
+            n = len(class_labels)
+            z = torch.randn(n, vae.out_channels, *input_size, device=device)
+            y = class_labels * 2
+        else:
+            # Labels to condition the model with (feel free to change):
+            if args.num_classes == 1000:
+                class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+            else:
+                class_labels = [0]
+            n = imgs.size(0)
+            z = torch.randn(n, 4, input_size, input_size, device=device)
+            y = torch.zeros(imgs.shape[0], dtype=torch.long, device=device)
+            y_null = torch.zeros(imgs.shape[0], dtype=torch.long, device=device)
+            y = torch.cat([y, y_null], 0)
+
+        # Setup classifier-free guidance:
+        z = torch.cat([z, z], 0)
+        imgs = torch.cat([imgs, imgs], 0)
+        model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+
+        # Sample images:
+        print(imgs.shape, z.shape, model_kwargs)
+        samples = diffusion.p_sample_loop(
+            model.forward_with_cfg, imgs, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+        )
+        samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        
+        elapsed = time.time() - start_time
+        test_loop.set_postfix(time=f"{elapsed:.2f}s")
+        #logger.info(f"Sampling on test dataset: {idx}/{len(test_dataloader)-1} | {elapsed:.2f}s")
+        #if idx >= 10:
+        #    logger.info("Sampling break")
+        #    break
+
+        # Save and display images:
+        if args.use_video:
+            samples = vae.decode(samples)
+            save_sample(samples)
+        else:
+            samples = vae.decode(samples / 0.18215).sample
+            #save_image(samples.mean(dim=1, keepdim=True), "sample.pdf", nrow=4, normalize=True, value_range=(-1, 1))  # Save mean image
+            all_samples.append(samples.cpu())
+    all_imgs = torch.cat(all_imgs, dim=0).numpy()
+    all_masks = torch.cat(all_masks, dim=0).numpy()
+    all_samples = torch.cat(all_samples, dim=0).numpy()
+    all_img_times = torch.cat(all_img_times, dim=0).numpy()
+    all_mask_times = torch.cat(all_mask_times, dim=0).numpy()
+    np.save(os.path.join(args.results, args.label, f'sats_{args.in_dim-1}.npy'), all_imgs)
+    np.save(os.path.join(args.results, args.label, 'reals.npy'), all_masks)
+    np.save(os.path.join(args.results, args.label, 'doutputs.npy'), all_samples)
+    np.save(os.path.join(args.results, args.label, 'sat_times.npy'), all_img_times)
+    np.save(os.path.join(args.results, args.label, 'real_times.npy'), all_mask_times)
 
 
 if __name__ == "__main__":
@@ -127,7 +221,7 @@ if __name__ == "__main__":
         "--model", type=str, choices=list(DiT_models.keys()) + list(Latte_models.keys()), default="DiT-XL/2"
     )
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image_size", type=int, choices=[128, 256, 512], default=128)
     parser.add_argument("--num_classes", type=int, default=1000)
     parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--num_sampling_steps", type=int, default=250)
@@ -142,5 +236,23 @@ if __name__ == "__main__":
         default=None,
         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).",
     )
+
+    # SHRIMP
+    parser.add_argument("--outputs", type=str, default="./outputs", help="Path to the output directory")
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
+
+    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to the sat dataset")
+    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to the radar dataset")
+    parser.add_argument("--start_date", type=str, default="20000101", help="Set dataset start date")
+    parser.add_argument("--end_date", type=str, default="20251231", help="Set dataset end date")
+    parser.add_argument("--max_folders", type=int, default=None, help="Set dataset max folders")
+    parser.add_argument("--history_frames", type=int, default=0, help="Number of history frames")
+    parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
+    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames")
+    parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
+    parser.add_argument("--in_dim", type=int, default=5, help="Input dimension of the model, 4, 6 or more satellite channels, 1 radar channel")
+    parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")
+
     args = parser.parse_args()
     main(args)

@@ -234,7 +234,7 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, model, x, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
+    def p_mean_variance(self, model, x, cond, t, clip_denoised=True, denoised_fn=None, model_kwargs=None):
         """
         Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
         the initial x, x_0.
@@ -259,7 +259,7 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, t, **model_kwargs)
+        model_output = model(th.cat((x, cond), dim=1), t, **model_kwargs)
         if isinstance(model_output, tuple):
             model_output, extra = model_output
         else:
@@ -358,6 +358,7 @@ class GaussianDiffusion:
         self,
         model,
         x,
+        cond,
         t,
         clip_denoised=True,
         denoised_fn=None,
@@ -383,6 +384,7 @@ class GaussianDiffusion:
         out = self.p_mean_variance(
             model,
             x,
+            cond,
             t,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
@@ -398,6 +400,7 @@ class GaussianDiffusion:
     def p_sample_loop(
         self,
         model,
+        cond,
         shape,
         noise=None,
         clip_denoised=True,
@@ -428,6 +431,7 @@ class GaussianDiffusion:
         final = None
         for sample in self.p_sample_loop_progressive(
             model,
+            cond,
             shape,
             noise=noise,
             clip_denoised=clip_denoised,
@@ -443,6 +447,7 @@ class GaussianDiffusion:
     def p_sample_loop_progressive(
         self,
         model,
+        cond,
         shape,
         noise=None,
         clip_denoised=True,
@@ -480,6 +485,7 @@ class GaussianDiffusion:
                 out = self.p_sample(
                     model,
                     img,
+                    cond,
                     t,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
@@ -493,6 +499,7 @@ class GaussianDiffusion:
         self,
         model,
         x,
+        cond,
         t,
         clip_denoised=True,
         denoised_fn=None,
@@ -507,6 +514,7 @@ class GaussianDiffusion:
         out = self.p_mean_variance(
             model,
             x,
+            cond,
             t,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
@@ -533,6 +541,7 @@ class GaussianDiffusion:
         self,
         model,
         x,
+        cond,
         t,
         clip_denoised=True,
         denoised_fn=None,
@@ -547,6 +556,7 @@ class GaussianDiffusion:
         out = self.p_mean_variance(
             model,
             x,
+            cond,
             t,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
@@ -569,6 +579,7 @@ class GaussianDiffusion:
     def ddim_sample_loop(
         self,
         model,
+        cond,
         shape,
         noise=None,
         clip_denoised=True,
@@ -586,6 +597,7 @@ class GaussianDiffusion:
         final = None
         for sample in self.ddim_sample_loop_progressive(
             model,
+            cond,
             shape,
             noise=noise,
             clip_denoised=clip_denoised,
@@ -602,6 +614,7 @@ class GaussianDiffusion:
     def ddim_sample_loop_progressive(
         self,
         model,
+        cond,
         shape,
         noise=None,
         clip_denoised=True,
@@ -638,6 +651,7 @@ class GaussianDiffusion:
                 out = self.ddim_sample(
                     model,
                     img,
+                    cond,
                     t,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
@@ -648,7 +662,7 @@ class GaussianDiffusion:
                 yield out
                 img = out["sample"]
 
-    def _vb_terms_bpd(self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None):
+    def _vb_terms_bpd(self, model, x_start, x_t, cond, t, clip_denoised=True, model_kwargs=None):
         """
         Get a term for the variational lower-bound.
         The resulting units are bits (rather than nats, as one might expect).
@@ -658,7 +672,7 @@ class GaussianDiffusion:
                  - 'pred_xstart': the x_0 predictions.
         """
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)
-        out = self.p_mean_variance(model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
+        out = self.p_mean_variance(model, x_t, cond, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
         kl = normal_kl(true_mean, true_log_variance_clipped, out["mean"], out["log_variance"])
         kl = mean_flat(kl) / np.log(2.0)
 
@@ -673,7 +687,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, cond, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -705,7 +719,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, t, **model_kwargs)
+            model_output = model(th.cat((x_t, cond), dim=1), t, **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -721,6 +735,7 @@ class GaussianDiffusion:
                     model=lambda *args, r=frozen_out: r,
                     x_start=x_start,
                     x_t=x_t,
+                    cond=cond,
                     t=t,
                     clip_denoised=False,
                 )["output"]

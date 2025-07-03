@@ -1,5 +1,14 @@
 python sample.py \
-    --model DiT-XL/2 \
-    --image_size 256 \
-    --num_classes 10 \
-    --ckpt ckpt_path
+    --model DiT-B/2 \
+    --batch_size 4 \
+    --num_classes 0 \
+    --sat_files_path /ssd/yghu/Data/dataset/noradar \
+    --radar_files_path /ssd/yghu/Data/dataset/radar/71 \
+    --start_date 20210101 \
+    --end_date 20210630 \
+    --max_folders 10 \
+    --history_frames 0 \
+    --future_frame 0 \
+    --refresh_rate 10 \
+    --retrieve_dataset \
+    --ckpt ./outputs/033-DiT-B-2/epoch15-global_step1000/model \

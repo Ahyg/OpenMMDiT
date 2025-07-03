@@ -60,7 +60,8 @@ class DiT(nn.Module):
         self.learn_sigma = learn_sigma
         self.use_video = use_video
         self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        #self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.out_channels = 4 * 2 if learn_sigma else 4 #hardcoded
         self.hidden_size = hidden_size
         self.patch_size = patch_size
         self.input_size = input_size

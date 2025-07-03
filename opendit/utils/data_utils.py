@@ -75,7 +75,7 @@ def prepare_dataloader(
         num_replicas=pg_manager.size(pg_manager.dp_axis),
         rank=pg_manager.coordinate(pg_manager.dp_axis),
         shuffle=shuffle,
-    )
+    ) if pg_manager is not None else None
 
     # Deterministic dataloader
     def seed_worker(worker_id):

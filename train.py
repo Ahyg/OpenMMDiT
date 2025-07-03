@@ -37,6 +37,10 @@ from opendit.utils.train_utils import all_reduce_mean, format_numel_str, get_mod
 from opendit.utils.video_utils import DatasetFromCSV, get_transforms_image, get_transforms_video
 from opendit.vae.wrapper import AutoencoderKLWrapper
 
+# SHRIMP
+from opendit.utils.DatasetBuilder import DatasetBuilder
+from opendit.utils.dataset import SatelliteDataset
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -124,6 +128,7 @@ def main(args):
             assert input_size[i] % vae.patch_size[i] == 0, "Input size must be divisible by patch size"
         input_size = [input_size[i] // vae.patch_size[i] for i in range(3)]
     else:
+        assert args.history_frames == 0, "History frames are not supported for image data."
         input_size = args.image_size // 8
 
     # Set mixed precision
@@ -139,6 +144,7 @@ def main(args):
     # Shared model config for two models
     model_config = {
         "input_size": input_size,
+        "in_channels": 12,  # 4 img_rgb + 4 img_extras + 4 radar #hardcoded
         "num_classes": args.num_classes,
         "enable_layernorm_kernel": args.enable_layernorm_kernel,
         "enable_modulate_kernel": args.enable_modulate_kernel,
@@ -210,34 +216,78 @@ def main(args):
 
     # Setup data:
     if args.use_video:
-        dataset = DatasetFromCSV(
-            args.data_path,
-            transform=get_transforms_video(args.image_size),
-            num_frames=args.num_frames,
-            frame_interval=args.frame_interval,
-        )
+        #dataset = DatasetFromCSV(
+        #    args.data_path,
+        #    transform=get_transforms_video(args.image_size),
+        #    num_frames=args.num_frames,
+        #    frame_interval=args.frame_interval,
+        #)
+        raise NotImplementedError("Video data is not implemented yet.")
     else:
         # master process goes first
         if not coordinator.is_master():
             dist.barrier()
-        dataset = CIFAR10(args.data_path, transform=get_transforms_image(args.image_size), download=True)
+        # Prepare dataset
+        datasetbuilder = DatasetBuilder(
+            sat_path=args.sat_files_path,
+            radar_path=args.radar_files_path,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            max_folders=args.max_folders,
+            history_frames=args.history_frames,
+            future_frame=args.future_frame,
+            refresh_rate=args.refresh_rate,
+            coverage_threshold=0.05,
+            seed=96
+        )
+
+        dataset_pkl_name = "dataset_filelist.pkl"
+        dataset_pkl_path = os.path.join(args.outputs, dataset_pkl_name)
+        if args.retrieve_dataset:
+            train_files, val_files, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
+            logger.info(f"Loaded existing dataset from {dataset_pkl_path}")
+        else:
+            train_files, val_files, test_files = datasetbuilder.build_filelist(
+                save_dir=args.outputs,
+                file_name=dataset_pkl_name,
+                split_ratio=(0.7, 0.1, 0.2)
+            )
+            logger.info(f"Built new dataset to {dataset_pkl_path}")
+        
+        # Load dataset
+        train_dataset = SatelliteDataset(files=train_files, in_dim=args.in_dim, transform=None)
+        val_dataset = SatelliteDataset(files=val_files, in_dim=args.in_dim, transform=None)
+        test_dataset = SatelliteDataset(files=test_files, in_dim=args.in_dim, transform=None)
         if coordinator.is_master():
             dist.barrier()
-    dataloader = prepare_dataloader(
-        dataset,
+
+    train_dataloader = prepare_dataloader(
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=False,
         pin_memory=True,
         num_workers=args.num_workers,
         pg_manager=pg_manager,
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
+    val_dataloader = prepare_dataloader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=True,
+        num_workers=args.num_workers,
+        pg_manager=pg_manager,
+    )
+    
+    logger.info(f"Train Dataset contains {len(train_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
+    logger.info(f"Validation Dataset contains {len(val_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
 
     # Boost model for distributed training
     torch.set_default_dtype(dtype)
     model, optimizer, _, dataloader, lr_scheduler = booster.boost(
-        model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, dataloader=dataloader
+        model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, dataloader=train_dataloader
     )
     torch.set_default_dtype(torch.float)
     logger.info("Boost model for distributed training")
@@ -258,14 +308,14 @@ def main(args):
     if shard_ema:
         model_sharding(ema)
 
-    num_steps_per_epoch = len(dataloader)
+    num_steps_per_epoch = len(train_dataloader)
 
     logger.info(f"Training for {args.epochs} epochs...")
     # if resume training, set the sampler start index to the correct value
-    dataloader.sampler.set_start_index(sampler_start_idx)
+    train_dataloader.sampler.set_start_index(sampler_start_idx)
     for epoch in range(start_epoch, args.epochs):
-        dataloader.sampler.set_epoch(epoch)
-        dataloader_iter = iter(dataloader)
+        train_dataloader.sampler.set_epoch(epoch)
+        train_dataloader_iter = iter(train_dataloader)
         logger.info(f"Beginning epoch {epoch}...")
         with tqdm(
             range(start_step, num_steps_per_epoch),
@@ -276,25 +326,43 @@ def main(args):
         ) as pbar:
             for step in pbar:
                 if args.use_video:
-                    batch = next(dataloader_iter)
-                    x = batch["video"].to(device)
-                    y = batch["text"]
+                    #batch = next(train_dataloader_iter)
+                    #x = batch["video"].to(device)
+                    #y = batch["text"]
+                    raise NotImplementedError("Video data is not implemented yet.")
                 else:
-                    x, y = next(dataloader_iter)
-                    x = x.to(device)
-                    y = y.to(device)
+                    #x, y = next(dataloader_iter)
+                    #x = x.to(device)
+                    #y = y.to(device)
+                    imgs, masks, _, _ = next(train_dataloader_iter) #img[4, 128, 128, 4], mask[4, 128, 128, 1],sat_time[4, 1], radar_time[4, 1]
+
+                    imgs = imgs.to(device)
+                    masks = masks.to(device)
+                    imgs = imgs.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+                    masks = masks.permute(0, 3, 1, 2)
+
 
                 # VAE encode
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
-                    x = vae.encode(x)
+                    imgs_rgb = imgs[:, :3, :, :]  # (B, 3, H, W)
+                    imgs_extras = imgs[:, 3:, :, :].repeat(1, 3, 1, 1) if args.in_dim==5 else imgs[:, 3:, :, :]  # if (B, 1, H, W): -> (B, 3, H, W)
+                    masks = masks.repeat(1, 3, 1, 1)
+
+                    imgs_rgb = vae.encode(imgs_rgb)
+                    imgs_extras = vae.encode(imgs_extras)
+                    masks = vae.encode(masks)
                     if not args.use_video:
-                        x = x.latent_dist.sample().mul_(0.18215)
+                        imgs_rgb = imgs_rgb.latent_dist.sample().mul_(0.18215)
+                        imgs_extras = imgs_extras.latent_dist.sample().mul_(0.18215)
+                        imgs = torch.cat((imgs_rgb, imgs_extras), dim=1)  # (B, 8, H, W)
+                        masks = masks.latent_dist.sample().mul_(0.18215)
 
                 # Diffusion
-                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                t = torch.randint(0, diffusion.num_timesteps, (masks.shape[0],), device=device)
+                y = torch.zeros(masks.shape[0], dtype=torch.long, device=device)  # Dummy labels for training
                 model_kwargs = dict(y=y)
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss_dict = diffusion.training_losses(model, masks, imgs, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
                 booster.backward(loss=loss, optimizer=optimizer)
                 optimizer.step()
@@ -360,8 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--text_encoder", type=str, default="openai/clip-vit-base-patch32")
     parser.add_argument("--t5_text_encoder", type=str, default="google-t5/t5-small")
 
-    parser.add_argument("--data_path", type=str, default="./datasets", help="Path to the dataset")
-    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image_size", type=int, choices=[128, 256, 512], default=128)
     parser.add_argument("--num_classes", type=int, default=1000)
 
     parser.add_argument("--epochs", type=int, default=1400)
@@ -381,6 +448,19 @@ if __name__ == "__main__":
     parser.add_argument("--enable_flashattn", action="store_true", help="Enable flashattn kernel")
     parser.add_argument("--sequence_parallel_size", type=int, default=1, help="Sequence parallel size, enable if > 1")
     parser.add_argument("--sequence_parallel_type", type=str)
+
+    # SHRIMP
+    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to the sat dataset")
+    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to the radar dataset")
+    parser.add_argument("--start_date", type=str, default="20000101", help="Set dataset start date")
+    parser.add_argument("--end_date", type=str, default="20251231", help="Set dataset end date")
+    parser.add_argument("--max_folders", type=int, default=None, help="Set dataset max folders")
+    parser.add_argument("--history_frames", type=int, default=0, help="Number of history frames")
+    parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
+    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames")
+    parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
+    parser.add_argument("--in_dim", type=int, default=5, help="Input dimension of the model, 4, 6 or more satellite channels, 1 radar channel")
+    parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")
 
     args = parser.parse_args()
     main(args)
