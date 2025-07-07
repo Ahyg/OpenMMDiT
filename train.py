@@ -257,7 +257,6 @@ def main(args):
         # Load dataset
         train_dataset = SatelliteDataset(files=train_files, in_dim=args.in_dim, transform=None)
         val_dataset = SatelliteDataset(files=val_files, in_dim=args.in_dim, transform=None)
-        test_dataset = SatelliteDataset(files=test_files, in_dim=args.in_dim, transform=None)
         if coordinator.is_master():
             dist.barrier()
 
@@ -457,7 +456,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_folders", type=int, default=None, help="Set dataset max folders")
     parser.add_argument("--history_frames", type=int, default=0, help="Number of history frames")
     parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
-    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames")
+    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames in minutes")
     parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
     parser.add_argument("--in_dim", type=int, default=5, help="Input dimension of the model, 4, 6 or more satellite channels, 1 radar channel")
     parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")

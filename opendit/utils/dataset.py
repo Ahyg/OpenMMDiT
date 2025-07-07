@@ -62,15 +62,18 @@ class SatelliteDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        sat_files, radar_files = self.files[idx]
-        img, mask, sat_time, radar_time = self.read_data(sat_files, radar_files)
+        try:
+            sat_files, radar_files = self.files[idx]
+            img, mask, sat_time, radar_time = self.read_data(sat_files, radar_files)
 
-        #img = torch.from_numpy(img).float()
-        #mask = torch.from_numpy(mask).float()
-        sat_time = sat_time.astype('datetime64[s]').astype('int64')
-        radar_time = radar_time.astype('datetime64[s]').astype('int64')
+            sat_time = sat_time.astype('datetime64[s]').astype('int64')
+            radar_time = radar_time.astype('datetime64[s]').astype('int64')
 
-        return img, mask, sat_time, radar_time
+            return img, mask, sat_time, radar_time
+        except Exception as e:
+            print(f"❌ Error at index {idx}: {e}")
+            raise e
+
     
 # For old dataset
 class SatelliteDataset_o(Dataset):
