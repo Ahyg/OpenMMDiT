@@ -89,6 +89,8 @@ def main(args):
 
     # ==============================
     # Initialize Booster
+    # stage 2 = shards optimizer states + gradients
+    # initial scale for gradient scaler (useful for fp16 dynamic scaling)
     # ==============================
     if args.plugin == "zero2":
         plugin = LowLevelZeroPlugin(
