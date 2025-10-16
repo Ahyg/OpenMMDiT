@@ -166,3 +166,5 @@ coverage.xml
 
 # ignore data files
 datasets
+doutputs.npy
+

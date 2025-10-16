@@ -348,12 +348,11 @@ def main(args):
                     masks = masks.permute(0, 3, 1, 2).to(device, dtype=dtype)  # (B, H, W, C) -> (B, C, H, W)
 
                 # VAE encode
-                with torch.no_grad():
-                    # Map input images to latent space + normalize latents:
-                    #x = vae.encode(x)
-                    if not args.use_video:
-                        imgs = vae.encode_sat(imgs)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
-                        masks = vae.encode_radar(masks)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
+                # Map input images to latent space + normalize latents:
+                #x = vae.encode(x)
+                if not args.use_video:
+                    imgs = vae.encode_sat(imgs)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
+                    masks = vae.encode_radar(masks)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
 
                 # Diffusion
                 t = torch.randint(0, diffusion.num_timesteps, (masks.shape[0],), device=device)
@@ -401,7 +400,7 @@ def main(args):
                     )
 
         # the continue epochs are not resumed, so we need to reset the sampler start index and start step
-        dataloader.sampler.set_start_index(0)
+        train_dataloader.sampler.set_start_index(0)
         start_step = 0
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -470,11 +469,11 @@ if __name__ == "__main__":
     parser.add_argument("--history_frames", type=int, default=0, help="Number of past frames to use as input (set as 0 to use the current frame only)")
     parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
     parser.add_argument("--refresh_rate", type=int, default=10, help="Time interval (in minutes) between frames")
-    parser.add_argument("--coverage-threshold", default=0.05, type=float, help="Minimum radar reflectivity coverage threshold for selecting a valid frame (0.0 to 1.0)")
+    parser.add_argument("--coverage_threshold", default=0.05, type=float, help="Minimum radar reflectivity coverage threshold for selecting a valid frame (0.0 to 1.0)")
     parser.add_argument("--seed", type=int, default=96, help="Random seed for dataset buiding.")
-    parser.add_argument("--block-size", type=int, default=100, help="Number of sat-radar pairs to include per data segment.")
-    parser.add_argument("--split-ratio", type=parse_float_tuple, default=(0.7, 0.2, 0.1), help="Train/val/test split ratio (three floats in [0,1] that sum <= 1.0), e.g. 0.7, 0.1, 0.2")
-    parser.add_argument("--fixed-test-days", type=lambda s: s.split(","), default=None, help="Comma-separated list of fixed test folders")
+    parser.add_argument("--block_size", type=int, default=100, help="Number of sat-radar pairs to include per data segment.")
+    parser.add_argument("--split_ratio", type=parse_float_tuple, default=(0.7, 0.2, 0.1), help="Train/val/test split ratio (three floats in [0,1] that sum <= 1.0), e.g. 0.7, 0.1, 0.2")
+    parser.add_argument("--fixed_test_days", type=lambda s: s.split(","), default=None, help="Comma-separated list of fixed test folders")
     
     # Control parameters for experiments
     parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")

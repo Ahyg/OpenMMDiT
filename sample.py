@@ -21,9 +21,10 @@ from opendit.models.dit import DiT_models
 from opendit.models.latte import Latte_models
 from opendit.utils.download import find_model
 from opendit.vae.reconstruct import save_sample
-from opendit.vae.wrapper import AutoencoderKLWrapper
+from opendit.vae.wrapper import AutoencoderKLWrapper, MultiModalVAEWrapper
 
 # SHRIMP
+from opendit.utils.ckpt_utils import create_logger
 from opendit.utils.DatasetBuilder import DatasetBuilder
 from opendit.utils.dataset import SatelliteDataset
 from opendit.utils.data_utils import prepare_dataloader
@@ -59,7 +60,7 @@ def main(args):
         input_size = [input_size[i] // vae.patch_size[i] for i in range(3)]
     else:
         assert args.history_frames == 0, "History frames are not supported for image data."
-        vae = MultiModalVAEWrapper(vae, sat_chn=args.in_dim, radar_chn=args.out_dim)
+        vae = MultiModalVAEWrapper(vae, sat_chn=args.in_dim, radar_chn=args.out_dim).to(device)
         input_size = args.image_size // 8
 
 
@@ -78,6 +79,7 @@ def main(args):
     model = (
         model_class(
             input_size=input_size,
+            in_channels=8,  # 4 sat latent chn + 4 radar latent chn
             num_classes=args.num_classes,
             enable_flashattn=False,
             enable_layernorm_kernel=False,
@@ -112,7 +114,7 @@ def main(args):
     dataset_pkl_path = os.path.join(args.model_path, dataset_pkl_name)
     if args.retrieve_dataset:
         _, _, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
-        logger.info(f"Loaded existing dataset from {dataset_pkl_path}")
+        print(f"Loaded existing dataset from {dataset_pkl_path}")
     else:
         _, _, test_files = datasetbuilder.build_filelist_by_blocks(
             save_dir=args.model_path,
@@ -120,11 +122,11 @@ def main(args):
             block_size=args.block_size,
             split_ratio=args.split_ratio,
         )
-        logger.info(f"Built new dataset to {dataset_pkl_path}")
+        print(f"Built new dataset to {dataset_pkl_path}")
     
     # Load dataset
     test_dataset = SatelliteDataset(files=test_files, in_dim=args.in_dim, transform=None)
-    logger.info(f"[Test Dataset] Files: {len(test_files)}, Dataset length: {len(test_dataset)}")
+    print(f"[Test Dataset] Files: {len(test_files)}, Dataset length: {len(test_dataset)}")
     test_dataloader = prepare_dataloader(
         test_dataset,
         batch_size=args.batch_size,
@@ -143,8 +145,8 @@ def main(args):
         
         imgs_test.append(imgs)
         masks_test.append(masks)
-        img_times_test.append(imgs_time)
-        mask_times_test.append(masks_time)
+        img_times_test.append(img_times)
+        mask_times_test.append(mask_times)
 
         imgs = imgs.permute(0, 3, 1, 2).to(device, dtype=dtype)
 
@@ -180,7 +182,6 @@ def main(args):
         model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
 
         # Sample images:
-        print(imgs.shape, z.shape, model_kwargs)
         samples = diffusion.p_sample_loop(
             model.forward_with_cfg, imgs, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
         )
@@ -189,7 +190,7 @@ def main(args):
         elapsed = time.time() - start_time
         test_loop.set_postfix(time=f"{elapsed:.2f}s")
         #if idx >= 10:
-        #    logger.info("Sampling break")
+        #    print("Sampling break")
         #    break
 
         # Save and display images:
@@ -197,23 +198,40 @@ def main(args):
             samples = vae.decode(samples)
             save_sample(samples)
         else:
-            samples = vae.decode(samples / 0.18215).sample
+            samples = vae.decode_radar(samples)
             #save_image(samples.mean(dim=1, keepdim=True), "sample.pdf", nrow=4, normalize=True, value_range=(-1, 1))  # Save mean image
-            all_samples.append(samples.cpu())
+            samples = samples.permute(0, 2, 3, 1).cpu().numpy() / 2 + 0.5
+            doutputs.append(samples)
     
-    all_imgs = torch.cat(all_imgs, dim=0).numpy()
-    all_masks = torch.cat(all_masks, dim=0).numpy()
-    all_samples = torch.cat(all_samples, dim=0).numpy()
-    all_img_times = torch.cat(all_img_times, dim=0).numpy()
-    all_mask_times = torch.cat(all_mask_times, dim=0).numpy()
-    np.save(os.path.join(args.results, args.label, f'sats_{args.in_dim-1}.npy'), all_imgs)
-    np.save(os.path.join(args.results, args.label, 'reals.npy'), all_masks)
-    np.save(os.path.join(args.results, args.label, 'doutputs.npy'), all_samples)
-    np.save(os.path.join(args.results, args.label, 'sat_times.npy'), all_img_times)
-    np.save(os.path.join(args.results, args.label, 'real_times.npy'), all_mask_times)
+    #loaded_model_name = os.path.splitext(os.path.basename(args.load_model))[0]
+    loaded_model_name = "DiT-S-2"
+    result_dir = os.path.join(args.results, f"{loaded_model_name}")
+    os.makedirs(result_dir, exist_ok=True)
+    np.save(os.path.join(result_dir, f'doutputs.npy'), np.concatenate(doutputs, axis=0))  # 0~1
+    print(f"Test results saved to {os.path.join(result_dir, f'doutputs.npy')}")
+    os.makedirs(args.datasets, exist_ok=True)
+    np.save(os.path.join(args.datasets, f'sats_{args.in_dim}.npy'), np.concatenate(imgs_test, axis=0))
+    np.save(os.path.join(args.datasets, f'sat_times.npy'), np.concatenate(img_times_test, axis=0))
+    np.save(os.path.join(args.datasets, f'reals.npy'), np.concatenate(masks_test, axis=0))
+    np.save(os.path.join(args.datasets, f'real_times.npy'), np.concatenate(mask_times_test, axis=0))
 
 
 if __name__ == "__main__":
+    # Parse tuple for dim_scales and input_shape
+    def parse_int_tuple(s):
+        try:
+            # Remove brackets, spaces, convert to integers
+            return tuple(map(int, s.strip().strip('()').replace(' ', '').split(',')))
+        except ValueError:
+            raise argparse.ArgumentTypeError("Tuple must be a string of integers separated by commas, like '1, 2, 3'.")
+
+    # Parse tuple for split_ratio    
+    def parse_float_tuple(s):
+        try:
+            return tuple(map(float, s.strip().strip('()').replace(' ', '').split(',')))
+        except ValueError:
+            raise argparse.ArgumentTypeError("Tuple must be a string of numbers separated by commas, like '0.7, 0.1, 0.2'.")
+    
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", type=str, choices=list(DiT_models.keys()) + list(Latte_models.keys()), default="DiT-XL/2"
@@ -223,7 +241,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_classes", type=int, default=1000)
     parser.add_argument("--cfg_scale", type=float, default=4.0)
     parser.add_argument("--num_sampling_steps", type=int, default=250)
-    parser.add_argument("--seed", type=int, default=0)
+    #parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--frame_interval", type=int, default=1)
     parser.add_argument("--use_video", action="store_true", help="Use video data instead of images.")
@@ -236,21 +254,30 @@ if __name__ == "__main__":
     )
 
     # SHRIMP
-    parser.add_argument("--outputs", type=str, default="./outputs", help="Path to the output directory")
+    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to satellite image data directory")
+    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to radar reflectivity image data directory")
+    parser.add_argument("--start_date", type=str, default="", help="Start date for dataset selection (e.g., 20210101)")
+    parser.add_argument("--end_date", type=str, default="", help="End date for dataset selection (e.g., 20210430)")
+    parser.add_argument("--max_folders", type=int, default=None, help="Maximum number of folders (days) to load. Use None to load all")
+    parser.add_argument("--history_frames", type=int, default=0, help="Number of past frames to use as input (set as 0 to use the current frame only)")
+    parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
+    parser.add_argument("--refresh_rate", type=int, default=10, help="Time interval (in minutes) between frames")
+    parser.add_argument("--coverage_threshold", default=0.05, type=float, help="Minimum radar reflectivity coverage threshold for selecting a valid frame (0.0 to 1.0)")
+    parser.add_argument("--seed", type=int, default=96, help="Random seed for dataset buiding.")
+    parser.add_argument("--block_size", type=int, default=100, help="Number of sat-radar pairs to include per data segment.")
+    parser.add_argument("--split_ratio", type=parse_float_tuple, default=(0.7, 0.2, 0.1), help="Train/val/test split ratio (three floats in [0,1] that sum <= 1.0), e.g. 0.7, 0.1, 0.2")
+    parser.add_argument("--fixed_test_days", type=lambda s: s.split(","), default=None, help="Comma-separated list of fixed test folders")
+    
+    # Control parameters for experiments
+    parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
+    parser.add_argument("--in_dim", type=int, default=4, help="Input dimension of the model, 4, 6 or more satellite channels")
+    parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")
+    parser.add_argument("--datasets", type=str, default="", help="Path to cached dataset (npy).")
+    parser.add_argument("--model_path", type=str, default="", help="Path to save or load model checkpoints and logs.")
+    parser.add_argument("--results", type=str, default="", help="Path to save inference results.")
+
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=4)
-
-    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to the sat dataset")
-    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to the radar dataset")
-    parser.add_argument("--start_date", type=str, default="20000101", help="Set dataset start date")
-    parser.add_argument("--end_date", type=str, default="20251231", help="Set dataset end date")
-    parser.add_argument("--max_folders", type=int, default=None, help="Set dataset max folders")
-    parser.add_argument("--history_frames", type=int, default=0, help="Number of history frames")
-    parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
-    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames")
-    parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
-    parser.add_argument("--in_dim", type=int, default=5, help="Input dimension of the model, 4, 6 or more satellite channels, 1 radar channel")
-    parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")
 
     args = parser.parse_args()
     main(args)

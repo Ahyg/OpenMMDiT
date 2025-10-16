@@ -1,14 +1,14 @@
 python sample.py \
     --model DiT-B/2 \
     --batch_size 4 \
-    --num_classes 0 \
-    --sat_files_path /ssd/yghu/Data/dataset/noradar \
-    --radar_files_path /ssd/yghu/Data/dataset/radar/71 \
-    --start_date 20210101 \
-    --end_date 20210630 \
-    --max_folders 10 \
-    --history_frames 0 \
-    --future_frame 0 \
-    --refresh_rate 10 \
+    --num_classes 1 \
+    --sat_files_path /mnt/ssd_1/yghu/Data/dataset/noradar \
+    --radar_files_path /mnt/ssd_1/yghu/Data/dataset/radar/71 \
+    --split_ratio "(0.7,0.2,0.1)" \
+    --block_size 100 \
     --retrieve_dataset \
-    --ckpt ./outputs/033-DiT-B-2/epoch15-global_step1000/model \
+    --block_size 10 \
+    --ckpt ./outputs/019-DiT-B-2/epoch98-global_step20000/model \
+    --model_path ./outputs/019-DiT-B-2 \
+    --datasets ./experiments/datasets \
+    --results ./experiments/results \
