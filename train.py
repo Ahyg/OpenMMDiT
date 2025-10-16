@@ -35,7 +35,7 @@ from opendit.utils.operation import model_sharding
 from opendit.utils.pg_utils import ProcessGroupManager
 from opendit.utils.train_utils import all_reduce_mean, format_numel_str, get_model_numel, requires_grad, update_ema
 from opendit.utils.video_utils import DatasetFromCSV, get_transforms_image, get_transforms_video
-from opendit.vae.wrapper import AutoencoderKLWrapper
+from opendit.vae.wrapper import AutoencoderKLWrapper, MultiModalVAEWrapper
 
 # SHRIMP
 from opendit.utils.DatasetBuilder import DatasetBuilder
@@ -131,6 +131,7 @@ def main(args):
         input_size = [input_size[i] // vae.patch_size[i] for i in range(3)]
     else:
         assert args.history_frames == 0, "History frames are not supported for image data."
+        vae = MultiModalVAEWrapper(vae, sat_chn=args.in_dim, radar_chn=args.out_dim)
         input_size = args.image_size // 8
 
     # Set mixed precision
@@ -142,11 +143,15 @@ def main(args):
         dtype = torch.float32
     else:
         raise ValueError(f"Unknown mixed precision {args.mixed_precision}")
+    
+    # Set vae to the same dtype as the model
+    if not args.use_video:
+        vae = vae.to(device).to(dtype)
 
     # Shared model config for two models
     model_config = {
         "input_size": input_size,
-        "in_channels": 12,  # 4 img_rgb + 4 img_extras + 4 radar #hardcoded
+        "in_channels": 8,  # 4 sat latent chn + 4 radar latent chn
         "num_classes": args.num_classes,
         "enable_layernorm_kernel": args.enable_layernorm_kernel,
         "enable_modulate_kernel": args.enable_modulate_kernel,
@@ -200,10 +205,10 @@ def main(args):
     diffusion = create_diffusion(timestep_respacing="")
 
     # Setup optimizer
+    # Train vae wrapper and model parameters
+    trainable_params = list(filter(lambda p: p.requires_grad, vae.parameters())) + list(filter(lambda p: p.requires_grad, model.parameters()))
     # We used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper
-    optimizer = HybridAdam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=0, adamw_mode=True
-    )
+    optimizer = HybridAdam(trainable_params, lr=args.lr, weight_decay=0, adamw_mode=True)
     # You can use a lr scheduler if you want
     # Recommend if you continue training from a model
     lr_scheduler = None
@@ -239,26 +244,28 @@ def main(args):
             history_frames=args.history_frames,
             future_frame=args.future_frame,
             refresh_rate=args.refresh_rate,
-            coverage_threshold=0.05,
-            seed=96
+            coverage_threshold=args.coverage_threshold,
+            seed=args.seed
         )
-
         dataset_pkl_name = "dataset_filelist.pkl"
-        dataset_pkl_path = os.path.join(args.outputs, dataset_pkl_name)
+        dataset_pkl_path = os.path.join(experiment_dir, dataset_pkl_name)
         if args.retrieve_dataset:
-            train_files, val_files, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
+            train_files, val_files, _ = datasetbuilder.load_filelist(dataset_pkl_path)
             logger.info(f"Loaded existing dataset from {dataset_pkl_path}")
         else:
-            train_files, val_files, test_files = datasetbuilder.build_filelist(
-                save_dir=args.outputs,
+            train_files, val_files, _ = datasetbuilder.build_filelist_by_blocks(
+                save_dir=experiment_dir,
                 file_name=dataset_pkl_name,
-                split_ratio=(0.7, 0.1, 0.2)
+                block_size=args.block_size,
+                split_ratio=args.split_ratio,
             )
             logger.info(f"Built new dataset to {dataset_pkl_path}")
         
         # Load dataset
         train_dataset = SatelliteDataset(files=train_files, in_dim=args.in_dim, transform=None)
         val_dataset = SatelliteDataset(files=val_files, in_dim=args.in_dim, transform=None)
+        logger.info(f"[Train Dataset] Files: {len(train_files)}, Dataset length: {len(train_dataset)}")
+        logger.info(f"[Val Dataset]   Files: {len(val_files)}, Dataset length: {len(val_dataset)}")
         if coordinator.is_master():
             dist.barrier()
 
@@ -271,23 +278,24 @@ def main(args):
         num_workers=args.num_workers,
         pg_manager=pg_manager,
     )
-
-    val_dataloader = prepare_dataloader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=True,
-        num_workers=args.num_workers,
-        pg_manager=pg_manager,
-    )
-    
-    logger.info(f"Train Dataset contains {len(train_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
-    logger.info(f"Validation Dataset contains {len(val_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
+    use_validation = len(val_dataset) > 0
+    if use_validation:
+        val_dataloader = prepare_dataloader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=True,
+            num_workers=args.num_workers,
+            pg_manager=pg_manager,
+        )
+    else:
+        val_dataloader = None
+        logger.warning("⚠️ Validation set is empty. Skipping validation during training.")
 
     # Boost model for distributed training
     torch.set_default_dtype(dtype)
-    model, optimizer, _, dataloader, lr_scheduler = booster.boost(
+    model, optimizer, _, train_dataloader, lr_scheduler = booster.boost(
         model=model, optimizer=optimizer, lr_scheduler=lr_scheduler, dataloader=train_dataloader
     )
     torch.set_default_dtype(torch.float)
@@ -335,29 +343,17 @@ def main(args):
                     #x, y = next(dataloader_iter)
                     #x = x.to(device)
                     #y = y.to(device)
-                    imgs, masks, _, _ = next(train_dataloader_iter) #img[4, 128, 128, 4], mask[4, 128, 128, 1],sat_time[4, 1], radar_time[4, 1]
-
-                    imgs = imgs.to(device)
-                    masks = masks.to(device)
-                    imgs = imgs.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
-                    masks = masks.permute(0, 3, 1, 2)
-
+                    imgs, masks, *_ = next(train_dataloader_iter) #img[B, H, W, in_dim], mask[b, H, W, out_dim], *_
+                    imgs = imgs.permute(0, 3, 1, 2).to(device, dtype=dtype)  # (B, H, W, C) -> (B, C, H, W)
+                    masks = masks.permute(0, 3, 1, 2).to(device, dtype=dtype)  # (B, H, W, C) -> (B, C, H, W)
 
                 # VAE encode
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
-                    imgs_rgb = imgs[:, :3, :, :]  # (B, 3, H, W)
-                    imgs_extras = imgs[:, 3:, :, :].repeat(1, 3, 1, 1) if args.in_dim==5 else imgs[:, 3:, :, :]  # if (B, 1, H, W): -> (B, 3, H, W)
-                    masks = masks.repeat(1, 3, 1, 1)
-
-                    imgs_rgb = vae.encode(imgs_rgb)
-                    imgs_extras = vae.encode(imgs_extras)
-                    masks = vae.encode(masks)
+                    #x = vae.encode(x)
                     if not args.use_video:
-                        imgs_rgb = imgs_rgb.latent_dist.sample().mul_(0.18215)
-                        imgs_extras = imgs_extras.latent_dist.sample().mul_(0.18215)
-                        imgs = torch.cat((imgs_rgb, imgs_extras), dim=1)  # (B, 8, H, W)
-                        masks = masks.latent_dist.sample().mul_(0.18215)
+                        imgs = vae.encode_sat(imgs)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
+                        masks = vae.encode_radar(masks)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
 
                 # Diffusion
                 t = torch.randint(0, diffusion.num_timesteps, (masks.shape[0],), device=device)
@@ -415,6 +411,21 @@ def main(args):
 
 
 if __name__ == "__main__":
+    # Parse tuple for dim_scales and input_shape
+    def parse_int_tuple(s):
+        try:
+            # Remove brackets, spaces, convert to integers
+            return tuple(map(int, s.strip().strip('()').replace(' ', '').split(',')))
+        except ValueError:
+            raise argparse.ArgumentTypeError("Tuple must be a string of integers separated by commas, like '1, 2, 3'.")
+
+    # Parse tuple for split_ratio    
+    def parse_float_tuple(s):
+        try:
+            return tuple(map(float, s.strip().strip('()').replace(' ', '').split(',')))
+        except ValueError:
+            raise argparse.ArgumentTypeError("Tuple must be a string of numbers separated by commas, like '0.7, 0.1, 0.2'.")
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", type=str, choices=list(DiT_models.keys()) + list(Latte_models.keys()) + list(MMDiT_models.keys()) + list(MMLatte_models.keys()), default="DiT-XL/2"
@@ -451,16 +462,23 @@ if __name__ == "__main__":
     parser.add_argument("--sequence_parallel_type", type=str)
 
     # SHRIMP
-    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to the sat dataset")
-    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to the radar dataset")
-    parser.add_argument("--start_date", type=str, default="20000101", help="Set dataset start date")
-    parser.add_argument("--end_date", type=str, default="20251231", help="Set dataset end date")
-    parser.add_argument("--max_folders", type=int, default=None, help="Set dataset max folders")
-    parser.add_argument("--history_frames", type=int, default=0, help="Number of history frames")
+    parser.add_argument("--sat_files_path", type=str, default="./datasets", help="Path to satellite image data directory")
+    parser.add_argument("--radar_files_path", type=str, default="./datasets", help="Path to radar reflectivity image data directory")
+    parser.add_argument("--start_date", type=str, default="", help="Start date for dataset selection (e.g., 20210101)")
+    parser.add_argument("--end_date", type=str, default="", help="End date for dataset selection (e.g., 20210430)")
+    parser.add_argument("--max_folders", type=int, default=None, help="Maximum number of folders (days) to load. Use None to load all")
+    parser.add_argument("--history_frames", type=int, default=0, help="Number of past frames to use as input (set as 0 to use the current frame only)")
     parser.add_argument("--future_frame", type=int, default=0, help="Predict which future frame")
-    parser.add_argument("--refresh_rate", type=int, default=10, help="Interval of frames in minutes")
+    parser.add_argument("--refresh_rate", type=int, default=10, help="Time interval (in minutes) between frames")
+    parser.add_argument("--coverage-threshold", default=0.05, type=float, help="Minimum radar reflectivity coverage threshold for selecting a valid frame (0.0 to 1.0)")
+    parser.add_argument("--seed", type=int, default=96, help="Random seed for dataset buiding.")
+    parser.add_argument("--block-size", type=int, default=100, help="Number of sat-radar pairs to include per data segment.")
+    parser.add_argument("--split-ratio", type=parse_float_tuple, default=(0.7, 0.2, 0.1), help="Train/val/test split ratio (three floats in [0,1] that sum <= 1.0), e.g. 0.7, 0.1, 0.2")
+    parser.add_argument("--fixed-test-days", type=lambda s: s.split(","), default=None, help="Comma-separated list of fixed test folders")
+    
+    # Control parameters for experiments
     parser.add_argument("--retrieve_dataset", action="store_true", help="store_true: no retrieve; store_false: retrieve")
-    parser.add_argument("--in_dim", type=int, default=5, help="Input dimension of the model, 4, 6 or more satellite channels, 1 radar channel")
+    parser.add_argument("--in_dim", type=int, default=4, help="Input dimension of the model, 4, 6 or more satellite channels")
     parser.add_argument("--out_dim", type=int, default=1, help="Output dimension of the model, 1 radar channel")
 
     args = parser.parse_args()

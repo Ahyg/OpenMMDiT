@@ -32,43 +32,53 @@ class MultiModalVAEWrapper(nn.Module):
     Provide small learnable projection convs that map sat channels / radar to VAE latent channels.
     Works for image mode (non-video). Input shapes assumed (B, C, H, W).
     """
-    def __init__(self, vae, sat_channels=4):
+    def __init__(self, vae, sat_chn=4, radar_chn=1, if_freeze=True):
         super().__init__()
         self.module = vae  # pretrained VAE
-        self.patch_size = [1, 8, 8]
+        self.if_freeze = if_freeze
+        if self.if_freeze:
+            for p in self.module.parameters():
+                p.requires_grad = False
 
-        # project extra satellite channels (e.g. channel 4) to latent channels
-        self.sat_proj = nn.Conv2d(sat_channels, self.latent_ch, kernel_size=1)
+        # project satellite / radar channels to RGB channels
+        self.sat_in = nn.Conv2d(sat_chn, 3, kernel_size=1)
+        self.sat_out = nn.Conv2d(3, sat_chn, kernel_size=1)
+        self.radar_in = nn.Conv2d(radar_chn, 3, kernel_size=1)
+        self.radar_out = nn.Conv2d(3, radar_chn, kernel_size=1)
 
-        # project radar (single-channel) to latent channels (used as target latent)
-        self.radar_proj = nn.Conv2d(1, self.latent_ch, kernel_size=1)
-        self.net = nn.Sequential(
-            nn.Conv2d(sat_channels, 64, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 3, 1)
-        )
-
-    def encode_rgb(self, x):
-        # x: (B,3,H,W)
-        with torch.no_grad():
-            out = self.module.encode(x).latent_dist.sample().mul_(0.18215)  # (B, latent_ch, H/8, W/8)
-        return out
+    def encode(self, x):
+        # x: (B, 3, H, W) -> (B, latent_ch, H/8, W/8)
+        with torch.no_grad() if self.if_freeze else torch.enable_grad():
+            x = self.module.encode(x).latent_dist.sample().mul_(0.18215)  # (B, latent_ch, H/8, W/8)
+        return x
+    
+    def decode(self, x):
+        # x: (B, latent_ch, H/8, W/8) -> (B, 3, H, W)
+        with torch.no_grad() if self.if_freeze else torch.enable_grad():
+            x = self.module.decode(x / 0.18215).sample
+        return x
 
     def encode_sat(self, x):
-        # x: (B, extra_ch, H, W) -> downsample then project
-        # Downsample factor must match VAE latent downsampling (8)
-        down = F.avg_pool2d(x, kernel_size=8)
-        return self.extra_proj(down)
+        # x: (B, sat_chn, H, W)
+        x = self.sat_in(x)
+        x = self.encode(x)
+        return x
 
     def encode_radar(self, x):
-        # x: (B,1,H,W) -> downsample then project
-        down = F.avg_pool2d(x, kernel_size=8)
-        return self.radar_proj(down)
+        # x: (B, radar_chn, H, W)
+        x = self.radar_in(x)
+        x = self.encode(x)
+        return x
+    
+    def decode_sat(self, x):
+        # x: (B, latent_ch, H/8, W/8)
+        x = self.decode(x)
+        x = self.sat_out(x)
+        return x
 
-    def decode_from_radar_latent(self, z):
-        # optional: decode using base VAE (z expected in latent space)
-        with torch.no_grad():
-            # VAE expects inputs scaled by /0.18215 when decoding
-            return self.module.decode(z / 0.18215).sample
+    def decode_radar(self, x):
+        # x: (B, latent_ch, H/8, W/8)
+        x = self.decode(x)
+        x = self.radar_out(x)
+        return x
+

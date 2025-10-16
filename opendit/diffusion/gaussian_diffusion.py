@@ -712,6 +712,7 @@ class GaussianDiffusion:
                 model=model,
                 x_start=x_start,
                 x_t=x_t,
+                cond=cond,
                 t=t,
                 clip_denoised=False,
                 model_kwargs=model_kwargs,

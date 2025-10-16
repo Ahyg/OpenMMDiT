@@ -59,6 +59,7 @@ def main(args):
         input_size = [input_size[i] // vae.patch_size[i] for i in range(3)]
     else:
         assert args.history_frames == 0, "History frames are not supported for image data."
+        vae = MultiModalVAEWrapper(vae, sat_chn=args.in_dim, radar_chn=args.out_dim)
         input_size = args.image_size // 8
 
 
@@ -77,7 +78,6 @@ def main(args):
     model = (
         model_class(
             input_size=input_size,
-            in_channels=12,  # 4 img_rgb + 4 img_extras + 4 radar #hardcoded
             num_classes=args.num_classes,
             enable_flashattn=False,
             enable_layernorm_kernel=False,
@@ -105,18 +105,26 @@ def main(args):
         history_frames=args.history_frames,
         future_frame=args.future_frame,
         refresh_rate=args.refresh_rate,
-        coverage_threshold=0.05,
-        seed=96
+        coverage_threshold=args.coverage_threshold,
+        seed=args.seed
     )
     dataset_pkl_name = "dataset_filelist.pkl"
-    dataset_pkl_path = os.path.join(args.outputs, dataset_pkl_name)
-    assert args.retrieve_dataset, "Please set --retrieve_dataset to True to load the dataset."
-    _, _, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
-    print(f"Loaded existing dataset from {dataset_pkl_path}")
+    dataset_pkl_path = os.path.join(args.model_path, dataset_pkl_name)
+    if args.retrieve_dataset:
+        _, _, test_files = datasetbuilder.load_filelist(dataset_pkl_path)
+        logger.info(f"Loaded existing dataset from {dataset_pkl_path}")
+    else:
+        _, _, test_files = datasetbuilder.build_filelist_by_blocks(
+            save_dir=args.model_path,
+            file_name=dataset_pkl_name,
+            block_size=args.block_size,
+            split_ratio=args.split_ratio,
+        )
+        logger.info(f"Built new dataset to {dataset_pkl_path}")
     
     # Load dataset
     test_dataset = SatelliteDataset(files=test_files, in_dim=args.in_dim, transform=None)
-
+    logger.info(f"[Test Dataset] Files: {len(test_files)}, Dataset length: {len(test_dataset)}")
     test_dataloader = prepare_dataloader(
         test_dataset,
         batch_size=args.batch_size,
@@ -125,37 +133,27 @@ def main(args):
         pin_memory=True,
         num_workers=args.num_workers,
     )
-    print(f"Test Dataset contains {len(test_dataset):,} images (Sat: {args.sat_files_path}; Radar: {args.radar_files_path})")
-    all_imgs = []
-    all_masks = []
-    all_img_times = []
-    all_mask_times = []
-    all_samples = []
+
+    doutputs, imgs_test, masks_test, img_times_test, mask_times_test = [], [], [], [], []
     test_loop = tqdm(test_dataloader, desc="Sampling (Test)", total=len(test_dataloader))
     for idx, data in enumerate(test_loop):
         start_time = time.time()
 
         imgs, masks, img_times, mask_times = data
         
-        all_imgs.append(imgs)
-        all_masks.append(masks)
-        all_img_times.append(img_times)
-        all_mask_times.append(mask_times)
+        imgs_test.append(imgs)
+        masks_test.append(masks)
+        img_times_test.append(imgs_time)
+        mask_times_test.append(masks_time)
 
-        imgs = imgs.permute(0, 3, 1, 2).to(device)
+        imgs = imgs.permute(0, 3, 1, 2).to(device, dtype=dtype)
 
         # VAE encode
         with torch.no_grad():
             # Map input images to latent space + normalize latents:
-            imgs_rgb = imgs[:, :3, :, :]  # (B, 3, H, W)
-            imgs_extras = imgs[:, 3:, :, :].repeat(1, 3, 1, 1) if args.in_dim==5 else imgs[:, 3:, :, :]  # if (B, 1, H, W): -> (B, 3, H, W)
-            imgs_rgb = vae.encode(imgs_rgb)
-            imgs_extras = vae.encode(imgs_extras)
-
+            #x = vae.encode(x)
             if not args.use_video:
-                imgs_rgb = imgs_rgb.latent_dist.sample().mul_(0.18215)
-                imgs_extras = imgs_extras.latent_dist.sample().mul_(0.18215)
-                imgs = torch.cat((imgs_rgb, imgs_extras), dim=1)  # (B, 8, H, W)
+                imgs = vae.encode_sat(imgs)  # (B, C, H, W) -> (B, latent_chn, H/8, W/8)
         
         # Create sampling noise:
         if args.use_video:
@@ -169,7 +167,7 @@ def main(args):
             if args.num_classes == 1000:
                 class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
             else:
-                class_labels = [0]
+                class_labels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
             n = imgs.size(0)
             z = torch.randn(n, 4, input_size, input_size, device=device)
             y = torch.zeros(imgs.shape[0], dtype=torch.long, device=device)
@@ -190,7 +188,6 @@ def main(args):
         
         elapsed = time.time() - start_time
         test_loop.set_postfix(time=f"{elapsed:.2f}s")
-        #logger.info(f"Sampling on test dataset: {idx}/{len(test_dataloader)-1} | {elapsed:.2f}s")
         #if idx >= 10:
         #    logger.info("Sampling break")
         #    break
@@ -203,6 +200,7 @@ def main(args):
             samples = vae.decode(samples / 0.18215).sample
             #save_image(samples.mean(dim=1, keepdim=True), "sample.pdf", nrow=4, normalize=True, value_range=(-1, 1))  # Save mean image
             all_samples.append(samples.cpu())
+    
     all_imgs = torch.cat(all_imgs, dim=0).numpy()
     all_masks = torch.cat(all_masks, dim=0).numpy()
     all_samples = torch.cat(all_samples, dim=0).numpy()

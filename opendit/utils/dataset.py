@@ -95,7 +95,7 @@ class SatelliteDataset_baseu(Dataset):
     
 # For Diff
 class SatelliteDataset(Dataset):
-    def __init__(self, files, in_dim=5, transform=None):
+    def __init__(self, files, in_dim=4, transform=None):
         super().__init__()
         self.files = files
         self.in_dim = in_dim
@@ -126,9 +126,9 @@ class SatelliteDataset(Dataset):
                         satcomp = sat_dset['satcomp'].values  # shape: (H, W, C1)
                         normed = sat_dset['normed'].values    # shape: (H, W, C=8)
                         normed_ltng = normed[:, :, 3:4]  # shape: (H, W, 1)
-                        if self.in_dim == 5:  # Sat + radar
+                        if self.in_dim == 4:  # Sat
                             sat = np.concatenate([satcomp, normed_ltng], axis=-1)  # shape: (H, W, C1+1)
-                        elif self.in_dim == 7:  # Sat (include sun) + radar
+                        elif self.in_dim == 6:  # Sat (include sun)
                             sun = normed[:, :, 6:8]
                             sat = np.concatenate([satcomp, normed_ltng, sun], axis=-1)  # shape: (H, W, C1+1+2)
                     elif 'satellite' in sat_dset:
